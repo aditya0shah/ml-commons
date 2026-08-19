@@ -11,6 +11,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 import org.opensearch.ml.common.agenticsearch.AgenticSearchTemplate;
+import org.opensearch.ml.common.agenticsearch.ParamSchema;
 
 /**
  * Derives a template's parameter structure from its Mustache body (design D6 / the
@@ -39,21 +40,20 @@ import org.opensearch.ml.common.agenticsearch.AgenticSearchTemplate;
  */
 public class MustacheTemplateAnalyzer {
 
-    // param-schema entry keys, shared with AgenticSearchTemplateService.
-    static final String TYPE_KEY = "type";
-    static final String REQUIRED_KEY = "required";
-    static final String DESCRIPTION_KEY = "description";
-    static final String ENUM_KEY = "enum";
-    static final String SOURCE_KEY = "source";
+    // param-schema entry keys and types. Defined in common so the query-time fill path
+    // in ml-algorithms shares one vocabulary with this deriver; aliased here for brevity.
+    static final String TYPE_KEY = ParamSchema.TYPE_KEY;
+    static final String REQUIRED_KEY = ParamSchema.REQUIRED_KEY;
+    static final String DESCRIPTION_KEY = ParamSchema.DESCRIPTION_KEY;
+    static final String ENUM_KEY = ParamSchema.ENUM_KEY;
+    static final String SOURCE_KEY = ParamSchema.SOURCE_KEY;
 
-    // Structural types we can infer from the body alone.
-    static final String TYPE_STRING = "string";
-    static final String TYPE_NUMBER = "number";
-    static final String TYPE_BOOLEAN = "boolean";
-    static final String TYPE_ARRAY = "array";
+    static final String TYPE_STRING = ParamSchema.TYPE_STRING;
+    static final String TYPE_NUMBER = ParamSchema.TYPE_NUMBER;
+    static final String TYPE_BOOLEAN = ParamSchema.TYPE_BOOLEAN;
+    static final String TYPE_ARRAY = ParamSchema.TYPE_ARRAY;
 
-    // Value of SOURCE_KEY for an enum derived from the index mapping.
-    static final String SOURCE_MAPPING = "mapping";
+    static final String SOURCE_MAPPING = ParamSchema.SOURCE_MAPPING;
 
     private MustacheTemplateAnalyzer() {}
 

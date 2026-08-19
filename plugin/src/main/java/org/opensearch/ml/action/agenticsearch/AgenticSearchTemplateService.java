@@ -47,6 +47,7 @@ import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.ml.common.CommonValue;
 import org.opensearch.ml.common.MLIndex;
 import org.opensearch.ml.common.agenticsearch.AgenticSearchTemplate;
+import org.opensearch.ml.common.agenticsearch.ParamSchema;
 import org.opensearch.ml.engine.indices.MLIndicesHandler;
 import org.opensearch.script.Script;
 import org.opensearch.script.ScriptService;
@@ -765,34 +766,12 @@ public class AgenticSearchTemplateService {
                 throw new IllegalArgumentException("param '" + name + "' has an empty or non-list 'enum'");
             }
             for (Object value : (List<?>) enumValues) {
-                if (!valueFitsType(value, (String) type)) {
+                if (!ParamSchema.valueFitsType(value, (String) type)) {
                     throw new IllegalArgumentException(
                         "param '" + name + "' enum value '" + value + "' does not fit declared type '" + type + "'"
                     );
                 }
             }
-        }
-    }
-
-    /**
-     * Whether a schema-supplied value is usable for a param of {@code type}. An
-     * {@code array} param is a triple-stache slot and must carry raw JSON as a string:
-     * the Mustache engine stringifies a {@code List} instead of emitting JSON
-     * ({@code [{"term":{"t":"a"}}]} becomes {@code {0={term={t=a}}}}).
-     */
-    private static boolean valueFitsType(Object value, String type) {
-        if (value == null) {
-            return false;
-        }
-        switch (type) {
-            case MustacheTemplateAnalyzer.TYPE_NUMBER:
-                return value instanceof Number;
-            case MustacheTemplateAnalyzer.TYPE_BOOLEAN:
-                return value instanceof Boolean;
-            case MustacheTemplateAnalyzer.TYPE_ARRAY:
-                return value instanceof String;
-            default:
-                return value instanceof String;
         }
     }
 
