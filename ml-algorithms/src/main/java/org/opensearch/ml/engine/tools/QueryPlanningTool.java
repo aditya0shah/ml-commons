@@ -35,14 +35,20 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.ml.common.settings.MLFeatureEnabledSetting;
 import org.opensearch.ml.common.spi.tools.Parser;
 import org.opensearch.ml.common.spi.tools.ToolAnnotation;
 import org.opensearch.ml.common.spi.tools.WithModelTool;
 import org.opensearch.ml.common.utils.ToolUtils;
 import org.opensearch.ml.engine.processor.ProcessorChain;
 import org.opensearch.ml.engine.tools.parser.ToolParser;
+import org.opensearch.ml.engine.tools.templatefill.StoredTemplateRenderer;
+import org.opensearch.ml.engine.tools.templatefill.TemplateFillPlanner;
+import org.opensearch.ml.engine.tools.templatefill.TemplateSchemaResolver;
+import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.transport.client.Client;
@@ -54,8 +60,15 @@ import lombok.Setter;
 import lombok.extern.log4j.Log4j2;
 
 /**
- * This tool supports different types of query planning,
- * llmGenerated, systemSearchTemplates or userSearchTemplates.
+ * This tool supports different types of query planning: llmGenerated, user_templates
+ * and template_fill.
+ *
+ * <p>llmGenerated and user_templates both end with the model writing a full DSL body;
+ * user_templates first has it pick a registered template, whose body is then shown to it as
+ * reference text it is free to ignore. template_fill is different in kind: the model emits
+ * only the template's parameter values and the stored body is rendered around them, so it
+ * never authors DSL. That path falls back to llmGenerated behavior whenever the fill cannot
+ * be trusted, which is why it lives in this tool rather than a separate one.
  */
 @Log4j2
 @ToolAnnotation(QueryPlanningTool.TYPE)
@@ -74,13 +87,14 @@ public class QueryPlanningTool implements WithModelTool {
     public static final String GENERATION_TYPE_FIELD = "generation_type";
     public static final String LLM_GENERATED_TYPE_FIELD = "llmGenerated";
     public static final String USER_SEARCH_TEMPLATES_TYPE_FIELD = "user_templates";
+    public static final String TEMPLATE_FILL_TYPE_FIELD = "template_fill";
     public static final String SEARCH_TEMPLATES_FIELD = "search_templates";
     public static final String SAMPLE_DOCUMENT_FIELD = "sample_document";
     private static final String CURRENT_TIME_FIELD = "current_time";
     public static final String TEMPLATE_FIELD = "template";
     public static final String STRICT_FIELD = "strict";
     public static final String QUESTION_FIELD = "question";
-    private static final String TEMPLATE_ID_FIELD = "template_id";
+    public static final String TEMPLATE_ID_FIELD = "template_id";
     private static final String TEMPLATE_DESCRIPTION_FIELD = "template_description";
     public static final String INDEX_NAME_FIELD = "index_name";
     private static final int MAX_TRUNCATE_CHARS = 250;
@@ -100,6 +114,12 @@ public class QueryPlanningTool implements WithModelTool {
     private final String searchTemplates;
     @Getter
     private final String fallbackQuery;
+    /** Registration-time template for the fill path; a per-request template_id overrides it. */
+    @Getter
+    private final String templateId;
+    /** Null when the fill path is not wired, in which case template_fill degrades to query planning. */
+    private final TemplateFillPlanner templateFillPlanner;
+    private final MLFeatureEnabledSetting mlFeatureEnabledSetting;
     @Setter
     @Getter
     private String name = TYPE;
@@ -142,11 +162,27 @@ public class QueryPlanningTool implements WithModelTool {
         String searchTemplates,
         String fallbackQuery
     ) {
+        this(generationType, queryGenerationTool, client, searchTemplates, fallbackQuery, null, null, null);
+    }
+
+    public QueryPlanningTool(
+        String generationType,
+        MLModelTool queryGenerationTool,
+        Client client,
+        String searchTemplates,
+        String fallbackQuery,
+        String templateId,
+        TemplateFillPlanner templateFillPlanner,
+        MLFeatureEnabledSetting mlFeatureEnabledSetting
+    ) {
         this.generationType = generationType;
         this.queryGenerationTool = queryGenerationTool;
         this.client = client;
         this.searchTemplates = searchTemplates;
         this.fallbackQuery = fallbackQuery;
+        this.templateId = templateId;
+        this.templateFillPlanner = templateFillPlanner;
+        this.mlFeatureEnabledSetting = mlFeatureEnabledSetting;
         this.attributes = new HashMap<>(DEFAULT_ATTRIBUTES);
     }
 
@@ -178,6 +214,11 @@ public class QueryPlanningTool implements WithModelTool {
                                 )
                         )
                     );
+                return;
+            }
+
+            if (generationType.equals(TEMPLATE_FILL_TYPE_FIELD)) {
+                runTemplateFill(parameters, listener);
                 return;
             }
 
@@ -235,6 +276,44 @@ public class QueryPlanningTool implements WithModelTool {
             log.error("Failed to run QueryPlannerTool", e);
             listener.onFailure(e);
         }
+    }
+
+    /**
+     * Fill a registered search template instead of writing DSL, and fall back to query
+     * planning if anything stops that from working.
+     *
+     * <p>The fallback is the whole reliability story of this path, which is why the fill
+     * lives here rather than in a tool of its own: an unregistered template, a fill that
+     * will not validate, a body that will not render, and the model judging the template
+     * unable to express the question all land in the same place — generating DSL for the
+     * question instead of returning a query that looks right and answers the wrong thing.
+     */
+    private <T> void runTemplateFill(Map<String, String> parameters, ActionListener<T> listener) {
+        String effectiveTemplateId = parameters.getOrDefault(TEMPLATE_ID_FIELD, templateId);
+        if (templateFillPlanner == null || effectiveTemplateId == null || effectiveTemplateId.isBlank()) {
+            log.warn("Template fill is configured but no template is available; generating the query instead");
+            planQueryWithDefaultTemplate(parameters, listener);
+            return;
+        }
+        if (mlFeatureEnabledSetting != null && !mlFeatureEnabledSetting.isAgenticSearchTemplateEnabled()) {
+            // The kill switch has to degrade rather than fail: turning the feature off
+            // should cost the fill, not the query. Note the setting gates only the CRUD
+            // REST layer, so this check is what keeps the query path honoring it too.
+            log.debug("Agentic search templates are disabled; generating the query instead");
+            planQueryWithDefaultTemplate(parameters, listener);
+            return;
+        }
+        String modelId = parameters.get(MODEL_ID_FIELD);
+        templateFillPlanner.fill(effectiveTemplateId, modelId, parameters, ActionListener.wrap(rendered -> {
+            @SuppressWarnings("unchecked")
+            T response = (T) rendered;
+            listener.onResponse(response);
+        }, e -> planQueryWithDefaultTemplate(parameters, listener)));
+    }
+
+    private <T> void planQueryWithDefaultTemplate(Map<String, String> parameters, ActionListener<T> listener) {
+        parameters.put(TEMPLATE_FIELD, DEFAULT_SEARCH_TEMPLATE);
+        executeQueryPlanning(parameters, listener);
     }
 
     @SuppressWarnings("unchecked")
@@ -438,6 +517,12 @@ public class QueryPlanningTool implements WithModelTool {
 
     public static class Factory implements WithModelTool.Factory<QueryPlanningTool> {
         private Client client;
+        private MLFeatureEnabledSetting mlFeatureEnabledSetting;
+        /**
+         * Built once per node so its schema cache is shared by every query, rather than
+         * per tool instance — tools are created per request.
+         */
+        private TemplateFillPlanner templateFillPlanner;
         private static volatile Factory INSTANCE;
 
         public static Factory getInstance() {
@@ -457,6 +542,26 @@ public class QueryPlanningTool implements WithModelTool {
             this.client = client;
         }
 
+        /**
+         * Wire the template-fill path. ScriptService renders the stored template in process
+         * and the registry parses the render back; without them the tool still works and
+         * template_fill degrades to query planning.
+         */
+        public void init(
+            Client client,
+            ScriptService scriptService,
+            NamedXContentRegistry xContentRegistry,
+            MLFeatureEnabledSetting mlFeatureEnabledSetting
+        ) {
+            this.client = client;
+            this.mlFeatureEnabledSetting = mlFeatureEnabledSetting;
+            this.templateFillPlanner = new TemplateFillPlanner(
+                client,
+                new TemplateSchemaResolver(client, xContentRegistry),
+                new StoredTemplateRenderer(scriptService, xContentRegistry)
+            );
+        }
+
         @Override
         public QueryPlanningTool create(Map<String, Object> params) {
             // Use agent's Agent model_id if tool doesn't have its own model_id
@@ -474,9 +579,11 @@ public class QueryPlanningTool implements WithModelTool {
             }
 
             // type validation
-            if (!(LLM_GENERATED_TYPE_FIELD.equals(type) || USER_SEARCH_TEMPLATES_TYPE_FIELD.equals(type))) {
+            if (!(LLM_GENERATED_TYPE_FIELD.equals(type)
+                || USER_SEARCH_TEMPLATES_TYPE_FIELD.equals(type)
+                || TEMPLATE_FILL_TYPE_FIELD.equals(type))) {
                 throw new IllegalArgumentException(
-                    "Invalid generation type: " + type + ". The current supported types are llmGenerated and user_templates."
+                    "Invalid generation type: " + type + ". The current supported types are llmGenerated, user_templates and template_fill."
                 );
             }
 
@@ -495,7 +602,20 @@ public class QueryPlanningTool implements WithModelTool {
 
             String fallbackQuery = params.containsKey(FALLBACK_QUERY_FIELD) ? (String) params.get(FALLBACK_QUERY_FIELD) : null;
 
-            QueryPlanningTool queryPlanningTool = new QueryPlanningTool(type, queryGenerationTool, client, searchTemplates, fallbackQuery);
+            // Optional at registration: a per-request template_id overrides it, and the fill
+            // path degrades to query planning when neither supplies one.
+            String templateId = params.containsKey(TEMPLATE_ID_FIELD) ? (String) params.get(TEMPLATE_ID_FIELD) : null;
+
+            QueryPlanningTool queryPlanningTool = new QueryPlanningTool(
+                type,
+                queryGenerationTool,
+                client,
+                searchTemplates,
+                fallbackQuery,
+                templateId,
+                templateFillPlanner,
+                mlFeatureEnabledSetting
+            );
 
             // Create parser with default extract_json processor + any custom processors
             queryPlanningTool.setOutputParser(createParserWithDefaultExtractJson(params));

@@ -649,7 +649,7 @@ public class QueryPlanningToolTests {
 
         Exception exception = assertThrows(IllegalArgumentException.class, () -> factory.create(map));
         assertEquals(
-            "Invalid generation type: invalid. The current supported types are llmGenerated and user_templates.",
+            "Invalid generation type: invalid. The current supported types are llmGenerated, user_templates and template_fill.",
             exception.getMessage()
         );
     }
