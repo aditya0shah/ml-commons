@@ -55,6 +55,8 @@ public class TemplateFillPlanner {
     public static final String USER_PROMPT_FIELD = "user_prompt";
     public static final String FILL_SCHEMA_FIELD = "fill_schema";
     public static final String LLM_INTERFACE_FIELD = "_llm_interface";
+    /** Plainer alias, since an operator sets this on the tool spec rather than the agent's LLM. */
+    public static final String LLM_INTERFACE_ALIAS_FIELD = "llm_interface";
     public static final String TENANT_ID_FIELD = "tenant_id";
 
     /** Params the model must never see: agent scaffolding, and our own injected plumbing. */
@@ -111,8 +113,8 @@ public class TemplateFillPlanner {
     ) {
         Map<String, Object> paramSchema = template.getParamSchema();
         Map<String, Object> inputSchema = FillToolSchemaBuilder.buildInputSchema(paramSchema);
-        String llmInterface = parameters.get(LLM_INTERFACE_FIELD);
-        boolean forced = ForcedToolCall.supportsForcedTool(llmInterface);
+        String llmInterface = llmInterface(parameters);
+        boolean forced = ForcedToolCall.shouldAttemptForcedTool(llmInterface);
 
         Map<String, String> predictionParams = new HashMap<>(parameters);
         NON_MODEL_PARAMS.forEach(predictionParams::remove);
@@ -126,7 +128,7 @@ public class TemplateFillPlanner {
                         .toolConfigJson(FillToolSchemaBuilder.FILL_TOOL_NAME, FillToolSchemaBuilder.FILL_TOOL_DESCRIPTION, inputSchema)
                 );
         } else {
-            // No way to force a tool on this interface, so the contract the tool schema
+            // This interface is known not to force tools, so the contract the tool schema
             // would have imposed has to be carried by the prompt instead. Still fills
             // templates; just without the schema-level guarantee.
             log.debug("llm interface '{}' cannot force a tool call; filling via prompt-enforced JSON", llmInterface);
@@ -200,12 +202,25 @@ public class TemplateFillPlanner {
     Map<String, Object> readFill(MLOutput output, String resultPath) {
         Map<String, ?> dataAsMap = firstTensorData(output);
         if (resultPath != null) {
-            Object toolInput = JsonPath.read(dataAsMap, resultPath);
-            Map<String, Object> arguments = asMap(toolInput);
-            if (arguments == null || arguments.isEmpty()) {
-                throw new IllegalArgumentException("forced tool call produced no input");
+            Object raw = null;
+            try {
+                raw = JsonPath.read(dataAsMap, resultPath);
+            } catch (Exception e) {
+                // There is no tool-use block at all. Either the connector's PREDICT action
+                // does not set supports_structured_output, so the toolConfig was never
+                // injected, or the model answered in text anyway. Read it as text below
+                // rather than spending another round trip.
+                log.debug("no tool call at {}; reading the response as text", resultPath);
             }
-            return arguments;
+            if (raw != null) {
+                // A tool-use block that came back empty is a different thing from no tool-use
+                // block, and worth saying so rather than reinterpreting the envelope as text.
+                Map<String, Object> arguments = asMap(raw);
+                if (arguments == null || arguments.isEmpty()) {
+                    throw new IllegalArgumentException("forced tool call produced no input");
+                }
+                return arguments;
+            }
         }
         Object text = dataAsMap.containsKey("response") ? dataAsMap.get("response") : dataAsMap;
         Map<String, Object> envelope = asMap(extractJson.process(StringUtils.toJson(text)));
@@ -219,6 +234,19 @@ public class TemplateFillPlanner {
             fill.put(FillToolSchemaBuilder.CANNOT_EXPRESS_FIELD, envelope.get(FillToolSchemaBuilder.CANNOT_EXPRESS_FIELD));
         }
         return fill;
+    }
+
+    /**
+     * The model's interface, under either the underscore-prefixed key the agent runners use or
+     * the plainer alias, since for a FLOW agent this only arrives if an operator set it on the
+     * tool spec.
+     */
+    private static String llmInterface(Map<String, String> parameters) {
+        String llmInterface = parameters.get(LLM_INTERFACE_FIELD);
+        if (llmInterface == null || llmInterface.isBlank()) {
+            llmInterface = parameters.get(LLM_INTERFACE_ALIAS_FIELD);
+        }
+        return llmInterface;
     }
 
     /** A JSON object as a mutable map, whether it arrives already parsed or as a string. */

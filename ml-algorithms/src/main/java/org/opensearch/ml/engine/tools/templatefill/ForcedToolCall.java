@@ -53,8 +53,10 @@ public final class ForcedToolCall {
     private ForcedToolCall() {}
 
     /**
-     * Whether this LLM interface can be made to call a specific tool with a supplied schema.
-     * Uses the same {@code _llm_interface} vocabulary the agent runners already thread through.
+     * Whether this LLM interface is known to support forcing a specific tool with a supplied
+     * schema. Uses the same {@code _llm_interface} vocabulary the agent runners thread
+     * through. A blank interface is unknown, not unsupported — see
+     * {@link #shouldAttemptForcedTool}.
      */
     public static boolean supportsForcedTool(String llmInterface) {
         if (llmInterface == null || llmInterface.isBlank()) {
@@ -65,11 +67,29 @@ public final class ForcedToolCall {
     }
 
     /**
-     * The JSON path at which the forced tool's arguments arrive, or null when this
-     * interface cannot force a tool.
+     * Whether to try forcing the tool: yes unless the interface is known not to support it.
+     *
+     * <p>An unset interface has to mean "try" rather than "give up". A FLOW agent — the agent
+     * type agentic search uses — never merges the agent's own parameters into a tool's execute
+     * params, so {@code _llm_interface} does not reach the tool unless an operator puts it on
+     * the tool spec. Treating that silence as "unsupported" would quietly route every request
+     * to the weaker prompt-enforced fill and lose the whole point of the path.
+     *
+     * <p>Trying costs nothing when the guess is wrong: the connector only substitutes
+     * {@code _toolConfig_json} when its PREDICT action sets
+     * {@code supports_structured_output}, so on a connector without it the parameter is
+     * ignored, and the reader falls back to pulling JSON out of the text response.
+     */
+    public static boolean shouldAttemptForcedTool(String llmInterface) {
+        return llmInterface == null || llmInterface.isBlank() || supportsForcedTool(llmInterface);
+    }
+
+    /**
+     * The JSON path at which a forced tool's arguments arrive, or null when the interface is
+     * known not to force tools.
      */
     public static String resultPath(String llmInterface) {
-        return supportsForcedTool(llmInterface) ? BEDROCK_TOOL_USE_RESULT_PATH : null;
+        return shouldAttemptForcedTool(llmInterface) ? BEDROCK_TOOL_USE_RESULT_PATH : null;
     }
 
     /**

@@ -42,6 +42,8 @@ import org.opensearch.transport.client.Client;
 public class TemplateFillPlannerTests {
 
     private static final String BEDROCK = "bedrock/converse/claude";
+    /** An interface known not to support forcing a tool. */
+    private static final String UNFORCEABLE = "openai/v1/chat/completions";
     private static final String TEMPLATE_ID = "product_search";
 
     @Mock
@@ -285,6 +287,84 @@ public class TemplateFillPlannerTests {
         assertTrue(result.error.getMessage().contains("no tensors"));
     }
 
+    // ---- an unset interface must still force the tool ----------------------
+
+    /**
+     * A FLOW agent never merges the agent's own parameters into a tool's execute params, so
+     * _llm_interface does not reach the tool unless an operator sets it on the tool spec.
+     * Treating that silence as "unsupported" would quietly route every agentic-search request
+     * to the weaker prompt-enforced fill.
+     */
+    @Test
+    public void fill_withNoDeclaredInterface_stillForcesTheTool() {
+        stubSchema(schemaWithQueryAndSize());
+        stubToolUse(Map.of("lex_query", "tents"));
+        when(renderer.render(any(), any())).thenReturn(Map.of("query", Map.of()));
+
+        Result result = fill(params("cheap tents", null));
+
+        assertNull(result.error);
+        Map<String, String> sent = capturePredictionParams();
+        assertNotNull(sent.get(ForcedToolCall.TOOL_CONFIG_PARAM));
+        assertEquals(TemplateFillPromptTemplate.FILL_SYSTEM_PROMPT, sent.get(TemplateFillPlanner.SYSTEM_PROMPT_FIELD));
+    }
+
+    @Test
+    public void fill_readsTheInterfaceFromThePlainerAlias() {
+        stubSchema(schemaWithQueryAndSize());
+        stubTextResponse("{\"params\":{\"lex_query\":\"tents\"}}");
+        when(renderer.render(any(), any())).thenReturn(Map.of("query", Map.of()));
+
+        Map<String, String> parameters = params("cheap tents", null);
+        parameters.put(TemplateFillPlanner.LLM_INTERFACE_ALIAS_FIELD, "openai/v1/chat/completions");
+        planner.fill(TEMPLATE_ID, "model-1", parameters, ActionListener.wrap(b -> {}, e -> {}));
+
+        assertFalse(capturePredictionParams().containsKey(ForcedToolCall.TOOL_CONFIG_PARAM));
+    }
+
+    /**
+     * Attempting the forced call costs nothing when the connector cannot honor it: the
+     * toolConfig is simply never substituted, so the answer arrives as text and is read as
+     * text rather than spending a second round trip.
+     */
+    @Test
+    public void fill_whenForcedCallIsIgnored_readsTheTextResponseInstead() {
+        stubSchema(schemaWithQueryAndSize());
+        stubTextResponse("{\"params\":{\"lex_query\":\"tents\",\"size\":5}}");
+        when(renderer.render(any(), any())).thenReturn(Map.of("query", Map.of()));
+
+        Result result = fill(params("cheap tents", null));
+
+        assertNull(result.error);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, Object>> renderParams = ArgumentCaptor.forClass(Map.class);
+        verify(renderer).render(any(), renderParams.capture());
+        assertEquals("tents", renderParams.getValue().get("lex_query"));
+        assertEquals(5L, renderParams.getValue().get("size"));
+    }
+
+    @Test
+    public void fill_whenForcedCallIsIgnoredAndTextIsProse_fails() {
+        stubSchema(schemaWithQueryAndSize());
+        stubTextResponse("I am not able to help with that.");
+
+        Result result = fill(params("cheap tents", null));
+
+        assertNotNull(result.error);
+    }
+
+    /** Abstention still lands when it comes back as text rather than a tool call. */
+    @Test
+    public void fill_whenForcedCallIsIgnoredAndTextAbstains_abstains() {
+        stubSchema(schemaWithQueryAndSize());
+        stubTextResponse("{\"params\":{},\"cannot_express\":true}");
+
+        Result result = fill(params("how many per brand?", null));
+
+        assertTrue(result.error instanceof TemplateFillPlanner.TemplateCannotExpressException);
+        verify(renderer, never()).render(any(), any());
+    }
+
     // ---- the prompt-enforced path -----------------------------------------
 
     /** Without a forcible interface the fill still runs, carried by the prompt instead. */
@@ -294,7 +374,7 @@ public class TemplateFillPlannerTests {
         stubTextResponse("Here you go: {\"params\":{\"lex_query\":\"tents\",\"size\":5},\"cannot_express\":false}");
         when(renderer.render(any(), any())).thenReturn(Map.of("query", Map.of()));
 
-        Result result = fill(params("cheap tents", "openai/v1/chat/completions"));
+        Result result = fill(params("cheap tents", UNFORCEABLE));
 
         assertNull(result.error);
         Map<String, String> sent = capturePredictionParams();
@@ -315,7 +395,7 @@ public class TemplateFillPlannerTests {
         stubSchema(schemaWithQueryAndSize());
         stubTextResponse("{\"params\":{},\"cannot_express\":true}");
 
-        Result result = fill(params("how many per brand?", null));
+        Result result = fill(params("how many per brand?", UNFORCEABLE));
 
         assertTrue(result.error instanceof TemplateFillPlanner.TemplateCannotExpressException);
         verify(renderer, never()).render(any(), any());
@@ -328,7 +408,7 @@ public class TemplateFillPlannerTests {
         stubTextResponse("{\"lex_query\":\"tents\"}");
         when(renderer.render(any(), any())).thenReturn(Map.of("query", Map.of()));
 
-        Result result = fill(params("cheap tents", null));
+        Result result = fill(params("cheap tents", UNFORCEABLE));
 
         assertNull(result.error);
     }
@@ -338,7 +418,7 @@ public class TemplateFillPlannerTests {
         stubSchema(schemaWithQueryAndSize());
         stubTextResponse("I could not do that.");
 
-        Result result = fill(params("cheap tents", null));
+        Result result = fill(params("cheap tents", UNFORCEABLE));
 
         assertNotNull(result.error);
     }
