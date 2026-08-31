@@ -232,20 +232,24 @@ public final class TemplateStructureAnalyzer {
             return new Facts(ROLE_SORT_ORDER, fieldList(prev), null);
         }
 
-        // Closed-vocabulary option slots.
-        if ("operator".equals(last)) {
+        // Closed-vocabulary option slots, each gated on the clause that declares it: the same
+        // key in another clause takes a different value set (a nested clause's score_mode
+        // allows none and forbids first, unlike function_score), so an ungated match would
+        // attach an enum whose values the clause rejects. A boost is only kept off the root,
+        // since it is valid in nearly every clause and its description names no field.
+        if ("operator".equals(last) && isMatchOptionScope(prev, prev2)) {
             return new Facts(ROLE_MATCH_OPERATOR, List.of(), null);
         }
-        if ("zero_terms_query".equals(last)) {
+        if ("zero_terms_query".equals(last) && isMatchOptionScope(prev, prev2)) {
             return new Facts(ROLE_ZERO_TERMS, List.of(), null);
         }
-        if ("score_mode".equals(last)) {
+        if ("score_mode".equals(last) && "function_score".equals(prev)) {
             return new Facts(ROLE_SCORE_MODE, List.of(), null);
         }
-        if ("boost_mode".equals(last)) {
+        if ("boost_mode".equals(last) && "function_score".equals(prev)) {
             return new Facts(ROLE_BOOST_MODE, List.of(), null);
         }
-        if ("boost".equals(last)) {
+        if ("boost".equals(last) && prev != null) {
             return new Facts(ROLE_BOOST, List.of(), null);
         }
 
@@ -465,23 +469,12 @@ public final class TemplateStructureAnalyzer {
         return Character.toUpperCase(joined.charAt(0)) + joined.substring(1) + ".";
     }
 
-    /** Resolve a scalar value at a key-path in a parsed JSON tree, or null if absent. */
+    /**
+     * Resolve a scalar value at a key-path in a parsed JSON tree, or null if absent or if the
+     * path lands on a container (a default is read from a scalar slot, not a sub-tree).
+     */
     static Object valueAt(Object root, List<Object> path) {
-        Object node = root;
-        for (Object step : path) {
-            if (step instanceof String && node instanceof Map) {
-                node = ((Map<?, ?>) node).get(step);
-            } else if (step instanceof Integer && node instanceof List) {
-                List<?> list = (List<?>) node;
-                int i = (Integer) step;
-                node = i >= 0 && i < list.size() ? list.get(i) : null;
-            } else {
-                return null;
-            }
-            if (node == null) {
-                return null;
-            }
-        }
+        Object node = navigate(root, path);
         return node instanceof Map || node instanceof List ? null : node;
     }
 
@@ -496,6 +489,15 @@ public final class TemplateStructureAnalyzer {
             || "match_bool_prefix".equals(clause)
             || "match_phrase".equals(clause)
             || "match_phrase_prefix".equals(clause);
+    }
+
+    /**
+     * Whether an option key at this path belongs to a match-family clause. A {@code match}
+     * declares its options under the field ({@code match.<field>.operator}) while a
+     * {@code multi_match} names its fields separately and declares them on the clause itself.
+     */
+    private static boolean isMatchOptionScope(String prev, String prev2) {
+        return "multi_match".equals(prev) || isFullTextClause(prev2);
     }
 
     private static String fullTextRole(String clause) {

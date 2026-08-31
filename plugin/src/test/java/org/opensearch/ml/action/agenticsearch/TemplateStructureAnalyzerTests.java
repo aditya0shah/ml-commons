@@ -7,6 +7,7 @@ package org.opensearch.ml.action.agenticsearch;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
@@ -434,6 +435,47 @@ public class TemplateStructureAnalyzerTests {
     }
 
     @Test
+    public void classify_multiMatchDeclaresItsOptionsOnTheClause() {
+        // multi_match names its fields separately, so its options sit on the clause itself
+        // rather than under a field as in a match clause.
+        checkSingle(
+            "string",
+            mk -> map("multi_match", map("query", "x", "fields", list("title"), "operator", mk)),
+            TemplateStructureAnalyzer.ROLE_MATCH_OPERATOR,
+            "Whether all query terms must match (and) or any may match (or)."
+        );
+        checkSingle(
+            "string",
+            mk -> map("multi_match", map("query", "x", "fields", list("title"), "zero_terms_query", mk)),
+            TemplateStructureAnalyzer.ROLE_ZERO_TERMS,
+            "Behavior when the analyzed query has no terms."
+        );
+    }
+
+    @Test
+    public void classify_scoreModeOutsideFunctionScoreIsUnclassified() {
+        // A nested clause's score_mode takes a different value set (it allows none and
+        // forbids first), so it must not pick up the function_score vocabulary.
+        checkUnclassified("string", mk -> map("nested", map("path", "variants", "score_mode", mk)));
+    }
+
+    @Test
+    public void classify_boostModeOutsideFunctionScoreIsUnclassified() {
+        checkUnclassified("string", mk -> map("some_clause", map("boost_mode", mk)));
+    }
+
+    @Test
+    public void classify_matchOptionsOutsideAMatchClauseAreUnclassified() {
+        checkUnclassified("string", mk -> map("some_clause", map("operator", mk)));
+        checkUnclassified("string", mk -> map("some_clause", map("zero_terms_query", mk)));
+    }
+
+    @Test
+    public void classify_boostAtTheRootIsUnclassified() {
+        checkUnclassified("number", mk -> map("boost", mk));
+    }
+
+    @Test
     public void locate_firstOccurrenceWins_whenParamAppearsTwice() {
         // A param used in two clauses is recorded at its first occurrence.
         Map<String, Object> schema = new LinkedHashMap<>();
@@ -530,6 +572,23 @@ public class TemplateStructureAnalyzerTests {
         if (expectedDesc != null) {
             assertEquals(expectedDesc, TemplateStructureAnalyzer.describe(facts, null));
         }
+    }
+
+    /**
+     * An unrecognized clause yields no role, and so neither a description nor an enum: the
+     * param keeps the base derivation rather than being given another clause's vocabulary.
+     */
+    private static void checkUnclassified(String type, Function<Object, Map<String, Object>> renderWith) {
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("p", spec(type, false));
+        TemplateStructureAnalyzer.MarkerSet markers = TemplateStructureAnalyzer.buildMarkers(schema);
+        Map<String, Object> rendered = renderWith.apply(markers.renderParams().get("p"));
+        TemplateStructureAnalyzer.Located loc = TemplateStructureAnalyzer.locate(rendered, markers).get("p");
+        assertNotNull("marker should still be located", loc);
+        TemplateStructureAnalyzer.Facts facts = TemplateStructureAnalyzer.classify(loc, rendered);
+        assertNull(facts.role);
+        assertNull(TemplateStructureAnalyzer.describe(facts, null));
+        assertNull(TemplateStructureAnalyzer.vocabEnum(facts));
     }
 
     private static TemplateStructureAnalyzer.Facts roleFacts(String role) {
