@@ -24,7 +24,7 @@ import java.util.Set;
  * enclosing clause and the field it targets, so {@code {{query}}} landing in
  * {@code match.title} becomes "Full-text query matched against the title field"
  * ({@link #classify}, {@link #describe}), and a slot with a closed OpenSearch vocabulary
- * (a sort order, a match operator) becomes an {@code enum} ({@link #vocabEnum}).
+ * (a sort order or a match operator) becomes an {@code enum} ({@link #vocabEnum}).
  *
  * <p>The clause table below encodes OpenSearch DSL grammar and is shared by every template
  * rather than being per-template logic. A param whose marker cannot be located, or whose
